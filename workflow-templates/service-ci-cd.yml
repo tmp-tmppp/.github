@@ -39,7 +39,7 @@ jobs:
     # comment (gh api repos/RSO-ekipa10/.github/commits/<tag> --jq .sha):
     #   uses: RSO-ekipa10/.github/.github/workflows/service-ci-cd.yml@<40-character SHA> # <tag>
     # Dependabot then keeps the pin current. Only until the first release tag exists: @main.
-    uses: RSO-ekipa10/.github/.github/workflows/service-ci-cd.yml@main
+    uses: tmp-tmppp/.github/.github/workflows/service-ci-cd.yml@main
     with:
       service: ${{ github.event.repository.name }}
       dockerhub-username: ${{ vars.DOCKERHUB_USERNAME }}

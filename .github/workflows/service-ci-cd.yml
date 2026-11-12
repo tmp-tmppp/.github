@@ -8,6 +8,55 @@
 #                       -> deploy (Helm to the prod namespace on AKS, smoke test, rollback on failure)
 #   manual run     deploy only: an image that main already built (redeploy or roll back by SHA)
 #
+# Input build-image (default true). A service that has no code and no image of its own, such as the
+# broker (the official NATS chart plus a few templates), calls this workflow with build-image: false:
+#   - skipped: the Node.js steps (setup, npm ci, lint, type check, tests, reports), the image build
+#     (pull requests), the build job (image build, push to Docker Hub, digest) and the image
+#     lookup of a manual run
+#   - changed: the chart checks and the deploy pass no image.repository, image.tag or image.digest;
+#     the deploy needs the test job, since there is no build job to vouch for it; a manual run
+#     redeploys the chart of that commit
+#   - the same: job ids, event rules, permissions, concurrency, the stuck-release check, the Azure
+#     login, Helm, the smoke test and the rollback
+# dockerhub-username, dockerhub-token, image-name and node-version are not needed then.
+#
+# Inputs public-host and host-values. Chart values that depend on the public address (the issuer of the tokens,
+# return and checkout URLs) are not written into values-prod.yaml: the caller passes the organization variable
+# PUBLIC_HOST and lists its own keys as KEY=TEMPLATE lines, for example
+#   host-values: |
+#     env.AUTH_ISSUER=https://{host}/realms/chance
+# Each line becomes --set-string KEY=VALUE ({host} replaced) for the prod chart checks and the deploy. The deploy
+# stops when host-values is set and PUBLIC_HOST is missing (the test job then checks every line with the stand-in host
+# public-host.invalid); image, podAnnotations and every key inside them are refused, and the chart's schema still
+# refuses a key it lacks.
+#
+# Input set-values and secret secret-values. More prod chart values as KEY=VALUE lines that must not be literals in
+# the repository: set-values from organization variables (shown in the public logs), secret-values from organization
+# secrets (for example tls.issuer.acme.email=<secrets.ACME_EMAIL>; each value is masked, written to an owner-only file
+# in RUNNER_TEMP and passed as --set-file KEY=PATH, never on a command line or in the log; Helm still keeps it in the
+# release history and the rendered objects, so credentials stay in app-env). They follow the host values; image,
+# podAnnotations and every key inside them are refused, and a key may be set only once across host-values, set-values
+# and secret-values, never together with a key inside it (Helm applies --set-file after every --set-string); an empty
+# value (a variable or secret that is not set) stops the deploy (the test job warns and leaves the line out).
+#
+# Step "Prod values hold no local address" (test job). Renders .Values exactly as the deploy passes them and fails on
+# a string value that holds a loopback or unspecified address (localhost and its aliases, a .localhost host, 127.x,
+# 0.0.0.0, 0 as a URL host, ::1, [::]), unless its key path is listed with a reason in <chart-path>/prod-local-allow.txt
+# (a pod-local sidecar or probe).
+#
+# Inputs prerequisite-manifests and prerequisite-charts. Third-party parts that the repository's chart needs in the
+# cluster, installed before it on every deploy (the gateway: the Gateway API CRDs, cert-manager and Traefik):
+#   prerequisite-manifests   one "URL sha256:DIGEST" per line: a cluster-wide bundle that ships no chart (CRDs)
+#   prerequisite-charts      one "RELEASE NAMESPACE REPOSITORY CHART VERSION sha256:DIGEST VALUES-FILE" per line,
+#                            VALUES-FILE a path in the repository or - for none; at most 4 charts
+# Both jobs download each part and stop when its sha256 differs from the pin, so a moved release or a republished
+# chart version never reaches the cluster. The test job validates them (manifests as they are, charts rendered with
+# their values file); the deploy job first stops when a prerequisite release is stuck, then applies the manifests
+# server-side, waits for their CRDs, and installs the charts in the order listed (a chart's crds/ folder applied the
+# same way first, because Helm never upgrades it; then helm upgrade --install --skip-crds, --create-namespace,
+# --rollback-on-failure, --wait), all before the application Secret and the repository's own chart. A rollback after a failed smoke test restores the repository's
+# own release only. All three inputs are empty by default, and then nothing changes.
+#
 # The job ids test, build and deploy are part of the check names: rename them only together
 # with the ruleset. Every action is pinned to a full commit SHA (tags can be moved by an
 # attacker); Dependabot proposes the action updates, the tool versions in "env" below are
@@ -64,6 +113,11 @@ on:
         type: boolean
         required: false
         default: true
+      build-image:
+        description: true = a Node.js service with a Dockerfile (npm checks, image build and push, image values for the chart); false = a chart with no image of its own (no Node.js steps, no image build, push or digest, no image values)
+        type: boolean
+        required: false
+        default: true
       sha:
         description: Manual runs only; full commit SHA of main whose image is already on Docker Hub (empty = the commit of the run)
         type: string
@@ -86,6 +140,34 @@ on:
         type: string
         required: false
         default: rso-cluster
+      public-host:
+        # An organization variable, passed explicitly like DOCKERHUB_USERNAME. The deploy job requires it when
+        # host-values is set; the test job applies it to the prod chart checks when it is there (pull requests from
+        # Dependabot or forks get no organization variables and still pass).
+        description: Public host name of the gateway, no scheme, port or path (for example chance.example.org); pass vars.PUBLIC_HOST
+        type: string
+        required: false
+        default: ""
+      host-values:
+        description: Chart values that depend on the public host, one KEY=TEMPLATE per line ({host} becomes public-host), each passed as --set-string to the prod chart checks and to the deploy; empty lines and comment lines are skipped
+        type: string
+        required: false
+        default: ""
+      set-values:
+        description: More prod chart values, one KEY=VALUE per line (meant for organization variables that must not be literals in the repository), each passed as --set-string after the host-values to the prod chart checks and to the deploy; an empty value stops the deploy; empty lines and comment lines are skipped
+        type: string
+        required: false
+        default: ""
+      prerequisite-manifests:
+        description: Cluster-wide manifests that ship no chart (CRD bundles), one "URL sha256:DIGEST" per line; checked against the digest and validated by the test job, applied server-side before the prerequisite charts by the deploy
+        type: string
+        required: false
+        default: ""
+      prerequisite-charts:
+        description: Third-party charts installed in this order before the repository's own chart, one "RELEASE NAMESPACE REPOSITORY CHART VERSION sha256:DIGEST VALUES-FILE" per line (REPOSITORY https:// or oci://, one exact VERSION, the sha256 of the chart archive, VALUES-FILE a path in the repository or -); at most 4
+        type: string
+        required: false
+        default: ""
     secrets:
       dockerhub-token:
         # Not "required": pull requests from Dependabot or forks get no organization secrets,
@@ -101,6 +183,12 @@ on:
         required: false
       app-env:
         description: Optional secret application settings in KEY=value lines; the deploy turns them into the Secret <service>-env
+        required: false
+      secret-values:
+        # Not "required", like the others: pull requests from Dependabot or forks get no organization secrets. A caller
+        # that builds the lines with format() keeps the key, so the test job can name it and the deploy can refuse an
+        # empty value.
+        description: More prod chart values from organization secrets, one KEY=VALUE per line (the same key rules as set-values); each value goes to an owner-only file and is passed as --set-file KEY=PATH to the prod chart checks and to the deploy; an empty value stops the deploy; empty lines and comment lines are skipped
         required: false
     outputs:
       image-digest:
@@ -122,6 +210,15 @@ env:
   VALUES_FILE: ${{ inputs.values-file }}
   DEV_VALUES_FILE: ${{ inputs.dev-values-file }}
   NAMESPACE: ${{ inputs.namespace }}
+  WITH_IMAGE: ${{ inputs.build-image }} # the strings true and false, for the shell steps
+  # Read by the "Host-dependent values" steps only, never interpolated into a script.
+  PUBLIC_HOST: ${{ inputs.public-host }}
+  HOST_VALUES: ${{ inputs.host-values }}
+  # Read by the two steps "Prerequisites (fetch and verify)" only, never interpolated into a script. The set-values and
+  # secret-values are no workflow variables: they reach only the two steps "Deploy-time values (prod)" (step env), so a
+  # value such as a contact address is not listed in the environment of every step of the public log.
+  PREREQUISITE_MANIFESTS: ${{ inputs.prerequisite-manifests }}
+  PREREQUISITE_CHARTS: ${{ inputs.prerequisite-charts }}
   # Tool versions in one place (the same Helm and kubectl versions are used on our laptops).
   # Dependabot does not see these lines: bump them by hand (monthly, and kubectl on a cluster
   # upgrade; Helm stays 4.x, ADR-047). How to look up an image digest: README, "Tool versions".
@@ -153,27 +250,33 @@ jobs:
       - name: Workflow lint (actionlint, includes shellcheck)
         run: docker run --rm -v "$PWD":/repo -w /repo "$ACTIONLINT_IMAGE" -color
 
+      # The Node.js steps (up to the reports) run only for a service with code (build-image: true).
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: inputs.build-image
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm # needs a committed package-lock.json
 
       - name: Install dependencies exactly as locked
+        if: inputs.build-image
         run: npm ci
 
       - name: Lint
+        if: inputs.build-image
         run: npm run lint
 
       - name: Type check
+        if: inputs.build-image
         run: npm run typecheck
 
       - name: Unit tests with coverage
+        if: inputs.build-image
         # The service's "test" script runs the test runner once (for example "vitest run")
         # and writes coverage/ (and optionally reports/junit.xml).
         run: npm test -- --coverage
 
       - name: Keep the test and coverage reports
-        if: always()
+        if: always() && inputs.build-image
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-reports
@@ -192,33 +295,427 @@ jobs:
           helm version --short
           [[ "$(helm version --short)" == v4.* ]] || { echo "::error::expected Helm 4 ($HELM_VERSION)"; exit 1; }
 
+      - name: Host-dependent values (prod)
+        # The same script as the step of this name in the deploy job (keep the two equal); here a missing public-host
+        # only skips the values.
+        env:
+          REQUIRE_HOST: "false"
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          out="$RUNNER_TEMP/host-args"
+          : > "$out"
+          lines=()
+          while IFS= read -r raw || [[ -n "$raw" ]]; do
+            line="${raw#"${raw%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "$line" || "$line" == '#'* ]] && continue
+            lines+=("$line")
+          done <<< "$HOST_VALUES"
+          if (( ${#lines[@]} == 0 )); then
+            echo "No host-values: nothing depends on the public host."
+            exit 0
+          fi
+          host="$PUBLIC_HOST"
+          if [[ -z "$host" ]]; then
+            [[ "$REQUIRE_HOST" == true ]] \
+              && fail "host-values is set but public-host is empty: set the organization variable PUBLIC_HOST and pass it in"
+            # Pull requests from Dependabot or forks get no organization variables: check every line with a stand-in.
+            host=public-host.invalid
+            echo "::warning::public-host is empty: the prod chart checks use the stand-in host $host"
+          fi
+          label='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
+          host_re="^${label}(\\.${label})+$"
+          [[ "$host" =~ $host_re ]] \
+            || fail "public-host must be a lowercase host name with at least one dot, without scheme, port or path"
+          key_re='^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_])?$'
+          template_re='^[A-Za-z0-9._~:/?#@%=+{}-]+$'
+          for line in "${lines[@]}"; do
+            [[ "$line" == *=* ]] || fail "a host-values line has no '=': $line"
+            key="${line%%=*}"
+            template="${line#*=}"
+            [[ "$key" =~ $key_re ]] || fail "host-values key is not a chart value path: $key"
+            case "$key" in
+              image | image.* | podAnnotations | podAnnotations.*) fail "host-values may not set $key: the pipeline sets the image values and Pod annotations itself" ;;
+            esac
+            [[ "$template" =~ $template_re ]] \
+              || fail "the host-values template of $key may hold only letters, digits, {host} and . _ ~ : / ? # @ % = + -"
+            [[ "$template" == *'{host}'* ]] || fail "the host-values template of $key does not contain {host}"
+            value="${template//\{host\}/$host}"
+            [[ "$value" != *[{}]* ]] || fail "the host-values template of $key has a brace that is not part of {host}"
+            printf '%s\0' --set-string "$key=$value" >> "$out"
+            echo "$key=$value"
+          done
+
+      - name: Deploy-time values (prod)
+        # The same script as the step of this name in the deploy job (keep the two equal, the lint workflow diffs them);
+        # here an empty value only leaves the line out.
+        env:
+          REQUIRE_VALUES: "false"
+          SET_VALUES: ${{ inputs.set-values }}
+          SECRET_VALUES: ${{ secrets.secret-values }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          # Every file this step writes is owner-only (the secret values below go to files, never to a command line).
+          umask 077
+          # Appended to the file of the step "Host-dependent values (prod)", after its values: every step that reads
+          # host-args passes the host values first, then the set-values and secret-values, and the pipeline's own
+          # values last.
+          out="$RUNNER_TEMP/host-args"
+          touch "$out"
+          # Every key is set once, and never together with a key inside it (a parent and a child): Helm would merge or
+          # replace them in its own order (every --set-file after every --set-string), and the order above would not hold.
+          taken=()
+          claim() {
+            local t
+            for t in "${taken[@]}"; do
+              if [[ "$t" == "$1" || "$t" == "$1".* || "$1" == "$t".* ]]; then
+                fail "$2 sets $1, but $t is set already (host-values, set-values or secret-values): list each key once, never together with a key inside it"
+              fi
+            done
+            taken+=("$1")
+          }
+          # The keys of host-values: the file holds pairs of --set-string and KEY=VALUE.
+          mapfile -d '' -t prior < "$out"
+          for (( i = 1; i < ${#prior[@]}; i += 2 )); do claim "${prior[i]%%=*}" host-values; done
+          # Fills the array "lines" with the lines of $1, trimmed, without empty and comment lines.
+          read_lines() {
+            local raw line
+            lines=()
+            while IFS= read -r raw || [[ -n "$raw" ]]; do
+              line="${raw#"${raw%%[![:space:]]*}"}"
+              line="${line%"${line##*[![:space:]]}"}"
+              [[ -z "$line" || "$line" == '#'* ]] && continue
+              lines+=("$line")
+            done <<< "$1"
+          }
+          key_re='^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_])?$'
+          value_re='^[A-Za-z0-9._~:/?#@%=+-]+$'
+          read_lines "$SET_VALUES"
+          if (( ${#lines[@]} == 0 )); then echo "No set-values."; fi
+          for line in "${lines[@]}"; do
+            [[ "$line" == *=* ]] || fail "a set-values line has no '=': $line"
+            key="${line%%=*}"
+            value="${line#*=}"
+            [[ "$key" =~ $key_re ]] || fail "set-values key is not a chart value path: $key"
+            case "$key" in
+              image | image.* | podAnnotations | podAnnotations.*) fail "set-values may not set $key: the pipeline sets the image values and Pod annotations itself" ;;
+            esac
+            claim "$key" set-values
+            if [[ -z "$value" ]]; then
+              [[ "$REQUIRE_VALUES" == true ]] \
+                && fail "the set-values line of $key has an empty value: set the organization variable it reads and make it visible to this repository"
+              # Pull requests from Dependabot or forks get no organization variables.
+              echo "::warning::the set-values line of $key has an empty value: the prod chart checks run without it"
+              continue
+            fi
+            # The same characters as a host-values template without braces: --set-string never splits the value and the
+            # shell never reads it (so no comma, space, quote or $).
+            [[ "$value" =~ $value_re ]] \
+              || fail "the set-values value of $key may hold only letters, digits and . _ ~ : / ? # @ % = + -"
+            printf '%s\0' --set-string "$key=$value" >> "$out"
+            echo "$key is set"
+          done
+          read_lines "$SECRET_VALUES"
+          if (( ${#lines[@]} == 0 )); then echo "No secret-values."; fi
+          dir="$RUNNER_TEMP/secret-values"
+          n=0
+          for line in "${lines[@]}"; do
+            n=$((n + 1))
+            # A line of the secret is never printed: only its number and, once the key is checked, the key.
+            [[ "$line" == *=* ]] || fail "line $n of secret-values has no '=' (KEY=VALUE)"
+            key="${line%%=*}"
+            value="${line#*=}"
+            [[ "$key" =~ $key_re ]] || fail "the key of line $n of secret-values is not a chart value path"
+            case "$key" in
+              image | image.* | podAnnotations | podAnnotations.*) fail "secret-values may not set $key: the pipeline sets the image values and Pod annotations itself" ;;
+            esac
+            claim "$key" secret-values
+            if [[ -z "$value" ]]; then
+              [[ "$REQUIRE_VALUES" == true ]] \
+                && fail "the secret-values line of $key has an empty value: set the organization secret it reads and make it visible to this repository"
+              # Pull requests from Dependabot or forks get no organization secrets.
+              echo "::warning::the secret-values line of $key has an empty value: the prod chart checks run without it"
+              continue
+            fi
+            # GitHub masks the whole secret only, not a value inside it: mask the value for the rest of the job. The runner
+            # reads %25, %0D and %0A in a command as %, CR and LF, so those are escaped first, as @actions/core does, and
+            # a value with % or CR is masked as it is. The file gets the value without a final newline (--set-file keeps
+            # the content exactly), so the shell never parses it and Helm never splits it.
+            mask="${value//%/%25}"
+            mask="${mask//$'\r'/%0D}"
+            echo "::add-mask::${mask//$'\n'/%0A}"
+            mkdir -p "$dir"
+            file="$dir/$n"
+            [[ "$file" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "RUNNER_TEMP holds a character that --set-file would split: $RUNNER_TEMP"
+            printf '%s' "$value" > "$file"
+            printf '%s\0' --set-file "$key=$file" >> "$out"
+            echo "$key is set (from a secret, passed as a file)"
+          done
+
+      - name: Prerequisites (fetch and verify)
+        # The same script as the step of this name in the deploy job (keep the two equal, the lint workflow diffs them).
+        # Downloads every prerequisite, stops when its sha256 is not the pinned one, and writes the plan the next step
+        # reads.
+        if: inputs.prerequisite-manifests != '' || inputs.prerequisite-charts != ''
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          dir="$RUNNER_TEMP/prerequisites"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          plan="$dir/plan"
+          : > "$plan"
+          # The lines of one input, trimmed, without empty lines and comment lines.
+          lines_of() {
+            local raw line
+            while IFS= read -r raw || [[ -n "$raw" ]]; do
+              line="${raw#"${raw%%[![:space:]]*}"}"
+              line="${line%"${line##*[![:space:]]}"}"
+              [[ -z "$line" || "$line" == '#'* ]] && continue
+              printf '%s\n' "$line"
+            done <<< "$1"
+          }
+          mapfile -t manifests < <(lines_of "$PREREQUISITE_MANIFESTS")
+          mapfile -t charts < <(lines_of "$PREREQUISITE_CHARTS")
+          if (( ${#manifests[@]} + ${#charts[@]} == 0 )); then
+            echo "No prerequisites."
+            exit 0
+          fi
+          # The deploy job's timeout leaves 6 minutes for each chart (Helm's 5 and the wait for its CRDs) and 1 for each
+          # manifest.
+          (( ${#charts[@]} <= 4 )) || fail "at most 4 prerequisite-charts"
+          (( ${#manifests[@]} <= 4 )) || fail "at most 4 prerequisite-manifests"
+          name_re='^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$'
+          digest_re='^sha256:[0-9a-f]{64}$'
+          url_re='^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~%+-]+)+$'
+          repo_re='^(https|oci)://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~-]+)*$'
+          chart_re='^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$'
+          version_re='^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          path_re='^[A-Za-z0-9_][A-Za-z0-9._/-]*$'
+          check_digest() {
+            local got
+            got="sha256:$(sha256sum "$1" | cut -d' ' -f1)"
+            [[ "$got" == "$2" ]] || fail "$3 has the sha256 $got, not the pinned $2: the file changed upstream or the pin is wrong"
+          }
+          n=0
+          for line in "${manifests[@]}"; do
+            read -r -a f <<< "$line"
+            (( ${#f[@]} == 2 )) || fail "a prerequisite-manifests line needs 2 fields, URL and sha256:DIGEST: $line"
+            url="${f[0]}"
+            digest="${f[1]}"
+            [[ "$url" =~ $url_re ]] || fail "a prerequisite manifest needs a plain https:// URL (no query, port or user): $url"
+            [[ "$digest" =~ $digest_re ]] || fail "the digest of $url must be sha256: and 64 lowercase hex digits"
+            n=$((n + 1))
+            file="$dir/manifest-$n.yaml"
+            curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-filesize 50000000 -o "$file" "$url" \
+              || fail "could not download $url"
+            check_digest "$file" "$digest" "$url"
+            printf 'manifest\t%s\t%s\n' "$file" "$url" >> "$plan"
+            echo "manifest $url ($digest)"
+          done
+          seen=" "
+          for line in "${charts[@]}"; do
+            read -r -a f <<< "$line"
+            (( ${#f[@]} == 7 )) \
+              || fail "a prerequisite-charts line needs 7 fields, RELEASE NAMESPACE REPOSITORY CHART VERSION sha256:DIGEST VALUES-FILE: $line"
+            release="${f[0]}"
+            ns="${f[1]}"
+            repo="${f[2]}"
+            chart="${f[3]}"
+            version="${f[4]}"
+            digest="${f[5]}"
+            values="${f[6]}"
+            [[ "$release" =~ $name_re ]] || fail "a prerequisite release must be a lowercase name (letters, digits, dashes): $release"
+            [[ "$ns" =~ $name_re ]] || fail "the namespace of $release is not a valid Kubernetes name: $ns"
+            [[ "$ns/$release" != "$NAMESPACE/$SERVICE" ]] || fail "the prerequisite $release in $ns is the release of the repository's own chart"
+            [[ "$seen" != *" $ns/$release "* ]] || fail "the prerequisite $release in $ns is listed twice"
+            seen+="$ns/$release "
+            [[ "$repo" =~ $repo_re ]] || fail "the repository of $release must be an https:// or oci:// address: $repo"
+            [[ "$chart" =~ $chart_re ]] || fail "the chart of $release is not a chart name: $chart"
+            [[ "$version" =~ $version_re ]] || fail "the chart version of $release must be one exact version such as 1.2.3, not a range: $version"
+            [[ "$digest" =~ $digest_re ]] || fail "the digest of $release must be sha256: and 64 lowercase hex digits"
+            if [[ "$values" != - ]]; then
+              [[ "$values" =~ $path_re && "/$values/" != */../* ]] \
+                || fail "the values file of $release must be a path inside the repository, or - for none: $values"
+              [[ -f "$values" ]] || fail "the values file $values of $release is not in the repository"
+            fi
+            n=$((n + 1))
+            out="$dir/chart-$n"
+            mkdir "$out"
+            if [[ "$repo" == oci://* ]]; then
+              helm pull "$repo/$chart" --version "$version" -d "$out" || fail "could not pull $chart $version from $repo"
+            else
+              helm pull "$chart" --repo "$repo" --version "$version" -d "$out" || fail "could not pull $chart $version from $repo"
+            fi
+            archive=$(find "$out" -maxdepth 1 -name '*.tgz' -print -quit)
+            [[ -n "$archive" ]] || fail "helm pull of $chart $version left no chart archive"
+            check_digest "$archive" "$digest" "the chart archive of $chart $version"
+            printf 'chart\t%s\t%s\t%s\t%s\t%s\n' "$release" "$ns" "$archive" "$values" "$chart $version" >> "$plan"
+            echo "chart $chart $version ($digest): release $release in $ns, values file $values"
+          done
+
+      - name: Prerequisites match the schemas
+        # The same kubeconform options as the repository's own chart below. Charts with --include-crds, so the CRDs of
+        # their crds/ folder are checked too.
+        if: inputs.prerequisite-manifests != '' || inputs.prerequisite-charts != ''
+        run: |
+          validate() { docker run --rm -i "$KUBECONFORM_IMAGE" -strict -summary -ignore-missing-schemas -; }
+          while IFS=$'\t' read -r -u 3 kind a b c d e; do
+            case "$kind" in
+              manifest)
+                # a: the downloaded file, b: its URL
+                echo "::group::manifest $b"
+                validate < "$a"
+                echo "::endgroup::"
+                ;;
+              chart)
+                # a: release, b: namespace, c: the verified archive, d: values file or -, e: chart and version
+                values_args=()
+                if [[ "$d" != - ]]; then values_args=(-f "$d"); fi
+                echo "::group::$e as release $a in $b"
+                helm template "$a" "$c" -n "$b" --include-crds "${values_args[@]}" | validate
+                echo "::endgroup::"
+                ;;
+            esac
+          done 3< "$RUNNER_TEMP/prerequisites/plan"
+
       - name: Chart lint and schema check (dev and prod values)
         run: |
-          image_args=(--set-string "image.repository=$IMAGE" --set-string "image.tag=sha-$GITHUB_SHA")
+          image_args=()
+          if [[ "$WITH_IMAGE" == true ]]; then
+            image_args=(--set-string "image.repository=$IMAGE" --set-string "image.tag=sha-$GITHUB_SHA")
+          fi
+          host_args=()
+          if [[ -s "$RUNNER_TEMP/host-args" ]]; then mapfile -d '' -t host_args < "$RUNNER_TEMP/host-args"; fi
           for values in "$DEV_VALUES_FILE" "$VALUES_FILE"; do
             echo "::group::$values"
-            helm lint "$CHART" -f "$values" "${image_args[@]}"
-            helm template "$SERVICE" "$CHART" -n "$NAMESPACE" -f "$values" "${image_args[@]}" \
+            # The host-dependent values belong to prod only (the dev values keep their local addresses), and come
+            # first, so the pipeline's own values after them always win.
+            args=()
+            if [[ "$values" == "$VALUES_FILE" ]]; then args=("${host_args[@]}"); fi
+            args+=("${image_args[@]}")
+            helm lint "$CHART" -f "$values" "${args[@]}"
+            helm template "$SERVICE" "$CHART" -n "$NAMESPACE" -f "$values" "${args[@]}" \
               | docker run --rm -i "$KUBECONFORM_IMAGE" -strict -summary -ignore-missing-schemas -
             echo "::endgroup::"
           done
+
+      - name: Prod values hold no local address
+        # Reads the values exactly as the deploy passes them (the chart's values.yaml, the prod values file, then the
+        # host-values, set-values and secret-values, then the image values): a copy of the chart in RUNNER_TEMP gets one
+        # more template that prints .Values, and only that document is rendered. A string value with a loopback or
+        # unspecified address (localhost and its aliases, a .localhost host, 127.x in long and short forms, 0.0.0.0, 0 as
+        # a URL host, ::1, [::]) fails the job, unless its key path is listed with a reason in
+        # <chart-path>/prod-local-allow.txt (a pod-local sidecar or probe). A value from secret-values is never printed.
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          # The rendered values may hold a secret value: owner-only files, removed when the step ends.
+          umask 077
+          dir="$RUNNER_TEMP/prod-values"
+          trap 'rm -rf "$dir"' EXIT
+          image_args=()
+          if [[ "$WITH_IMAGE" == true ]]; then
+            image_args=(--set-string "image.repository=$IMAGE" --set-string "image.tag=sha-$GITHUB_SHA")
+          fi
+          host_args=()
+          if [[ -s "$RUNNER_TEMP/host-args" ]]; then mapfile -d '' -t host_args < "$RUNNER_TEMP/host-args"; fi
+          # The keys whose value comes from a secret (the file holds pairs of --set-file and KEY=PATH).
+          secret_keys=()
+          for (( i = 0; i + 1 < ${#host_args[@]}; i += 2 )); do
+            if [[ "${host_args[i]}" == --set-file ]]; then secret_keys+=("${host_args[i + 1]%%=*}"); fi
+          done
+          # True when the value at path $1 came from secret-values: the key itself, a key inside it, or, for a global, the
+          # copy Helm puts into every subchart (<subchart>.global.<rest>).
+          from_secret() {
+            local k
+            for k in "${secret_keys[@]}"; do
+              if [[ "$1" == "$k" || "$1" == "$k".* || "$1" == "$k"\[* ]]; then return 0; fi
+              if [[ "$k" == global.* ]] && [[ "$1" == *."$k" || "$1" == *."$k".* || "$1" == *."$k"\[* ]]; then return 0; fi
+            done
+            return 1
+          }
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          cp -R "$CHART/." "$dir/chart"
+          dump=templates/zz-ci-prod-values.yaml
+          [[ ! -e "$dir/chart/$dump" ]] || fail "the chart has its own $dump: rename it, this check adds a template of that name"
+          printf '%s\n' '{{ toJson .Values }}' > "$dir/chart/$dump"
+          helm template "$SERVICE" "$dir/chart" -n "$NAMESPACE" -f "$VALUES_FILE" "${host_args[@]}" "${image_args[@]}" \
+            --show-only "$dump" > "$dir/rendered"
+          grep '^{' "$dir/rendered" > "$dir/values.json" || fail "the prod values could not be rendered as JSON"
+          [[ "$(wc -l < "$dir/values.json")" -eq 1 ]] || fail "the rendered values are not one JSON document"
+          # Every string value with a local address: its key path (a.b[0].c) and the lines of the value that hold one.
+          # Each address counts only as a whole token; a network range (127.0.0.0/8, 0.0.0.0/0, ::1/128) does not count.
+          jq -r '
+            def is_local: test([
+                "(?<![a-z0-9-])(localhost|localhost\\.localdomain|ip6-localhost|ip6-loopback)(?![a-z0-9-]|\\.[a-z0-9])",
+                "(?<![0-9a-z._-])127(\\.[0-9]{1,3}){1,3}(?![0-9a-z_-]|\\.[0-9a-z]|/[0-9])",
+                "(?<![0-9a-z._-])0\\.0\\.0\\.0(?![0-9a-z_-]|\\.[0-9a-z]|/[0-9])",
+                "://([^/?#@\\s]*@)?0(?=[:/?#]|$)",
+                "(?<![0-9a-z:])(::|(0{1,4}:){7}0{0,3})1(?![0-9a-z:]|/[0-9])",
+                "\\[::\\]"
+              ] | join("|"); "i");
+            paths(type == "string") as $p
+            | getpath($p) as $v
+            | select($v | is_local)
+            | [($p | map(if type == "number" then "[\(.)]" else ".\(.)" end) | join("") | ltrimstr(".")),
+               ($v | split("\n") | map(select(is_local)) | join(" | "))]
+            | @tsv' "$dir/values.json" > "$dir/found.tsv"
+          checked=$(jq '[paths(type == "string")] | length' "$dir/values.json")
+          # The allow list: one "KEY.PATH REASON" per line; empty lines and comment lines are skipped.
+          allow_file="$CHART/prod-local-allow.txt"
+          declare -A allowed=()
+          if [[ -f "$allow_file" ]]; then
+            while IFS= read -r raw || [[ -n "$raw" ]]; do
+              line="${raw#"${raw%%[![:space:]]*}"}"
+              line="${line%"${line##*[![:space:]]}"}"
+              [[ -z "$line" || "$line" == '#'* ]] && continue
+              path="${line%%[[:space:]]*}"
+              reason="${line#"$path"}"
+              [[ -n "${reason//[[:space:]]/}" ]] || fail "$allow_file: the line of $path gives no reason (KEY.PATH REASON)"
+              allowed["$path"]=0
+            done < "$allow_file"
+          fi
+          bad=0
+          while IFS=$'\t' read -r path value; do
+            shown="$value"
+            if from_secret "$path"; then shown="(from secret-values, not shown)"; fi
+            if [[ -n "${allowed[$path]+listed}" ]]; then
+              allowed["$path"]=1
+              echo "Allowed by $allow_file: $path"
+            else
+              echo "::error::$path=$shown: a local address in the prod values; set the real address (values-prod.yaml or host-values), or list $path with a reason in $allow_file when it is pod-local (a sidecar or probe)"
+              bad=$((bad + 1))
+            fi
+          done < "$dir/found.tsv"
+          for path in "${!allowed[@]}"; do
+            if [[ "${allowed[$path]}" == 0 ]]; then
+              echo "::warning::$allow_file lists $path, but its prod value holds no local address: remove the line"
+            fi
+          done
+          (( bad == 0 )) || fail "$bad prod values hold a local address"
+          echo "No unlisted local address in the $checked string values of the prod values."
 
       - name: Chart has a smoke test (helm test hook)
         # Without a test hook "helm test" passes without testing anything after the deploy.
         if: inputs.deploy
         run: |
-          helm template "$SERVICE" "$CHART" -n "$NAMESPACE" -f "$VALUES_FILE" \
-            --set-string "image.repository=$IMAGE" --set-string "image.tag=sha-$GITHUB_SHA" \
+          image_args=()
+          if [[ "$WITH_IMAGE" == true ]]; then
+            image_args=(--set-string "image.repository=$IMAGE" --set-string "image.tag=sha-$GITHUB_SHA")
+          fi
+          host_args=()
+          if [[ -s "$RUNNER_TEMP/host-args" ]]; then mapfile -d '' -t host_args < "$RUNNER_TEMP/host-args"; fi
+          helm template "$SERVICE" "$CHART" -n "$NAMESPACE" -f "$VALUES_FILE" "${host_args[@]}" "${image_args[@]}" \
             | grep -Eq 'helm\.sh/hook"?:[[:space:]]*"?test' \
             || { echo "::error::the chart has no helm test hook (templates/tests/): the smoke test would check nothing"; exit 1; }
 
       - name: Set up Docker Buildx
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && inputs.build-image
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Image builds (not pushed)
         # Catches Dockerfile errors before the merge; pull requests never push images.
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && inputs.build-image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -228,7 +725,8 @@ jobs:
   build:
     needs: test
     # Only main publishes images: every image on Docker Hub passed the tests of its commit.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Skipped when the service has no image (build-image: false).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.build-image
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
@@ -286,17 +784,22 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
-    needs: build
-    # Push to main: only after a successful build. Manual run on main: test and build are
-    # skipped on purpose, and !cancelled() lets this job run anyway.
+    needs: [test, build]
+    # Push to main: only after a successful build, which itself needs a successful test. Without
+    # an image (build-image: false) there is no build job, so the test job is checked here.
+    # Manual run on main: test and build are skipped on purpose, and !cancelled() lets this job
+    # run anyway.
     if: >-
       ${{ !cancelled() && inputs.deploy && github.ref == 'refs/heads/main'
-      && ((github.event_name == 'push' && needs.build.result == 'success')
+      && ((github.event_name == 'push' && needs.test.result == 'success'
+      && (needs.build.result == 'success' || !inputs.build-image))
       || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     # Longer than the Helm timeouts below added up, so the job timeout never kills a running
     # "helm upgrade". A cancel by hand still can; the stuck-release check below then names the fix.
-    timeout-minutes: 25
+    # With prerequisites: 6 more minutes for each of at most 4 charts (Helm's 5 and 1 for the CRDs of its crds/ folder)
+    # and 1 for each of at most 4 manifests.
+    timeout-minutes: ${{ (inputs.prerequisite-manifests == '' && inputs.prerequisite-charts == '') && 25 || 55 }}
     # Deployment branch rule "main" on this environment; its history lists every prod deploy.
     environment: production
     permissions:
@@ -324,8 +827,10 @@ jobs:
           [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || fail "sha must be a full 40-character commit SHA"
           [[ "$SERVICE" =~ $name ]] || fail "service must be a lowercase name (letters, digits, dashes)"
           [[ "$NAMESPACE" =~ $name ]] || fail "namespace is not a valid Kubernetes name"
-          [[ "$IMAGE" =~ ^docker\.io/[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
-            || fail "invalid image name; is the organization variable DOCKERHUB_USERNAME visible to this repository?"
+          if [[ "$WITH_IMAGE" == true ]]; then
+            [[ "$IMAGE" =~ ^docker\.io/[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
+              || fail "invalid image name; is the organization variable DOCKERHUB_USERNAME visible to this repository?"
+          fi
           guid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
           [[ "$AZURE_CLIENT_ID" =~ $guid ]] \
             || fail "azure-client-id is empty or not an ID: set the organization variable AZURE_CLIENT_ID and pass it in"
@@ -333,6 +838,163 @@ jobs:
             || fail "azure-tenant-id is empty or not an ID: set the organization secret AZURE_TENANT_ID and pass it in"
           [[ "$AZURE_SUBSCRIPTION_ID" =~ $guid ]] \
             || fail "azure-subscription-id is empty or not an ID: set the organization secret AZURE_SUBSCRIPTION_ID and pass it in"
+
+      - name: Host-dependent values (prod)
+        # The same script as the step of this name in the test job (keep the two equal); here host-values without a
+        # public-host stops the deploy, so prod never starts with an empty issuer or a localhost address.
+        env:
+          REQUIRE_HOST: "true"
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          out="$RUNNER_TEMP/host-args"
+          : > "$out"
+          lines=()
+          while IFS= read -r raw || [[ -n "$raw" ]]; do
+            line="${raw#"${raw%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "$line" || "$line" == '#'* ]] && continue
+            lines+=("$line")
+          done <<< "$HOST_VALUES"
+          if (( ${#lines[@]} == 0 )); then
+            echo "No host-values: nothing depends on the public host."
+            exit 0
+          fi
+          host="$PUBLIC_HOST"
+          if [[ -z "$host" ]]; then
+            [[ "$REQUIRE_HOST" == true ]] \
+              && fail "host-values is set but public-host is empty: set the organization variable PUBLIC_HOST and pass it in"
+            # Pull requests from Dependabot or forks get no organization variables: check every line with a stand-in.
+            host=public-host.invalid
+            echo "::warning::public-host is empty: the prod chart checks use the stand-in host $host"
+          fi
+          label='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
+          host_re="^${label}(\\.${label})+$"
+          [[ "$host" =~ $host_re ]] \
+            || fail "public-host must be a lowercase host name with at least one dot, without scheme, port or path"
+          key_re='^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_])?$'
+          template_re='^[A-Za-z0-9._~:/?#@%=+{}-]+$'
+          for line in "${lines[@]}"; do
+            [[ "$line" == *=* ]] || fail "a host-values line has no '=': $line"
+            key="${line%%=*}"
+            template="${line#*=}"
+            [[ "$key" =~ $key_re ]] || fail "host-values key is not a chart value path: $key"
+            case "$key" in
+              image | image.* | podAnnotations | podAnnotations.*) fail "host-values may not set $key: the pipeline sets the image values and Pod annotations itself" ;;
+            esac
+            [[ "$template" =~ $template_re ]] \
+              || fail "the host-values template of $key may hold only letters, digits, {host} and . _ ~ : / ? # @ % = + -"
+            [[ "$template" == *'{host}'* ]] || fail "the host-values template of $key does not contain {host}"
+            value="${template//\{host\}/$host}"
+            [[ "$value" != *[{}]* ]] || fail "the host-values template of $key has a brace that is not part of {host}"
+            printf '%s\0' --set-string "$key=$value" >> "$out"
+            echo "$key=$value"
+          done
+
+      - name: Deploy-time values (prod)
+        # The same script as the step of this name in the test job (keep the two equal, the lint workflow diffs them);
+        # here an empty value stops the deploy, so prod never starts with a setting that silently fell away.
+        env:
+          REQUIRE_VALUES: "true"
+          SET_VALUES: ${{ inputs.set-values }}
+          SECRET_VALUES: ${{ secrets.secret-values }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          # Every file this step writes is owner-only (the secret values below go to files, never to a command line).
+          umask 077
+          # Appended to the file of the step "Host-dependent values (prod)", after its values: every step that reads
+          # host-args passes the host values first, then the set-values and secret-values, and the pipeline's own
+          # values last.
+          out="$RUNNER_TEMP/host-args"
+          touch "$out"
+          # Every key is set once, and never together with a key inside it (a parent and a child): Helm would merge or
+          # replace them in its own order (every --set-file after every --set-string), and the order above would not hold.
+          taken=()
+          claim() {
+            local t
+            for t in "${taken[@]}"; do
+              if [[ "$t" == "$1" || "$t" == "$1".* || "$1" == "$t".* ]]; then
+                fail "$2 sets $1, but $t is set already (host-values, set-values or secret-values): list each key once, never together with a key inside it"
+              fi
+            done
+            taken+=("$1")
+          }
+          # The keys of host-values: the file holds pairs of --set-string and KEY=VALUE.
+          mapfile -d '' -t prior < "$out"
+          for (( i = 1; i < ${#prior[@]}; i += 2 )); do claim "${prior[i]%%=*}" host-values; done
+          # Fills the array "lines" with the lines of $1, trimmed, without empty and comment lines.
+          read_lines() {
+            local raw line
+            lines=()
+            while IFS= read -r raw || [[ -n "$raw" ]]; do
+              line="${raw#"${raw%%[![:space:]]*}"}"
+              line="${line%"${line##*[![:space:]]}"}"
+              [[ -z "$line" || "$line" == '#'* ]] && continue
+              lines+=("$line")
+            done <<< "$1"
+          }
+          key_re='^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_])?$'
+          value_re='^[A-Za-z0-9._~:/?#@%=+-]+$'
+          read_lines "$SET_VALUES"
+          if (( ${#lines[@]} == 0 )); then echo "No set-values."; fi
+          for line in "${lines[@]}"; do
+            [[ "$line" == *=* ]] || fail "a set-values line has no '=': $line"
+            key="${line%%=*}"
+            value="${line#*=}"
+            [[ "$key" =~ $key_re ]] || fail "set-values key is not a chart value path: $key"
+            case "$key" in
+              image | image.* | podAnnotations | podAnnotations.*) fail "set-values may not set $key: the pipeline sets the image values and Pod annotations itself" ;;
+            esac
+            claim "$key" set-values
+            if [[ -z "$value" ]]; then
+              [[ "$REQUIRE_VALUES" == true ]] \
+                && fail "the set-values line of $key has an empty value: set the organization variable it reads and make it visible to this repository"
+              # Pull requests from Dependabot or forks get no organization variables.
+              echo "::warning::the set-values line of $key has an empty value: the prod chart checks run without it"
+              continue
+            fi
+            # The same characters as a host-values template without braces: --set-string never splits the value and the
+            # shell never reads it (so no comma, space, quote or $).
+            [[ "$value" =~ $value_re ]] \
+              || fail "the set-values value of $key may hold only letters, digits and . _ ~ : / ? # @ % = + -"
+            printf '%s\0' --set-string "$key=$value" >> "$out"
+            echo "$key is set"
+          done
+          read_lines "$SECRET_VALUES"
+          if (( ${#lines[@]} == 0 )); then echo "No secret-values."; fi
+          dir="$RUNNER_TEMP/secret-values"
+          n=0
+          for line in "${lines[@]}"; do
+            n=$((n + 1))
+            # A line of the secret is never printed: only its number and, once the key is checked, the key.
+            [[ "$line" == *=* ]] || fail "line $n of secret-values has no '=' (KEY=VALUE)"
+            key="${line%%=*}"
+            value="${line#*=}"
+            [[ "$key" =~ $key_re ]] || fail "the key of line $n of secret-values is not a chart value path"
+            case "$key" in
+              image | image.* | podAnnotations | podAnnotations.*) fail "secret-values may not set $key: the pipeline sets the image values and Pod annotations itself" ;;
+            esac
+            claim "$key" secret-values
+            if [[ -z "$value" ]]; then
+              [[ "$REQUIRE_VALUES" == true ]] \
+                && fail "the secret-values line of $key has an empty value: set the organization secret it reads and make it visible to this repository"
+              # Pull requests from Dependabot or forks get no organization secrets.
+              echo "::warning::the secret-values line of $key has an empty value: the prod chart checks run without it"
+              continue
+            fi
+            # GitHub masks the whole secret only, not a value inside it: mask the value for the rest of the job. The runner
+            # reads %25, %0D and %0A in a command as %, CR and LF, so those are escaped first, as @actions/core does, and
+            # a value with % or CR is masked as it is. The file gets the value without a final newline (--set-file keeps
+            # the content exactly), so the shell never parses it and Helm never splits it.
+            mask="${value//%/%25}"
+            mask="${mask//$'\r'/%0D}"
+            echo "::add-mask::${mask//$'\n'/%0A}"
+            mkdir -p "$dir"
+            file="$dir/$n"
+            [[ "$file" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "RUNNER_TEMP holds a character that --set-file would split: $RUNNER_TEMP"
+            printf '%s' "$value" > "$file"
+            printf '%s\0' --set-file "$key=$file" >> "$out"
+            echo "$key is set (from a secret, passed as a file)"
+          done
 
       - name: A manual run deploys only a commit of main
         # The image check below proves only that an image exists; this proves that the chart and
@@ -353,6 +1015,7 @@ jobs:
 
       - name: Image digest (built by this run, or looked up for a manual run)
         id: image
+        if: inputs.build-image
         run: |
           if [[ -n "$BUILT_DIGEST" ]]; then
             digest="$BUILT_DIGEST"
@@ -423,6 +1086,189 @@ jobs:
           fi
           exit 1
 
+      - name: Prerequisites (fetch and verify)
+        # The same script as the step of this name in the test job (keep the two equal, the lint workflow diffs them).
+        # Downloads every prerequisite again (the jobs share no files), stops when its sha256 is not the pinned one,
+        # and writes the plan the next step installs. The values files come from the commit being deployed.
+        if: inputs.prerequisite-manifests != '' || inputs.prerequisite-charts != ''
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          dir="$RUNNER_TEMP/prerequisites"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          plan="$dir/plan"
+          : > "$plan"
+          # The lines of one input, trimmed, without empty lines and comment lines.
+          lines_of() {
+            local raw line
+            while IFS= read -r raw || [[ -n "$raw" ]]; do
+              line="${raw#"${raw%%[![:space:]]*}"}"
+              line="${line%"${line##*[![:space:]]}"}"
+              [[ -z "$line" || "$line" == '#'* ]] && continue
+              printf '%s\n' "$line"
+            done <<< "$1"
+          }
+          mapfile -t manifests < <(lines_of "$PREREQUISITE_MANIFESTS")
+          mapfile -t charts < <(lines_of "$PREREQUISITE_CHARTS")
+          if (( ${#manifests[@]} + ${#charts[@]} == 0 )); then
+            echo "No prerequisites."
+            exit 0
+          fi
+          # The deploy job's timeout leaves 6 minutes for each chart (Helm's 5 and the wait for its CRDs) and 1 for each
+          # manifest.
+          (( ${#charts[@]} <= 4 )) || fail "at most 4 prerequisite-charts"
+          (( ${#manifests[@]} <= 4 )) || fail "at most 4 prerequisite-manifests"
+          name_re='^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$'
+          digest_re='^sha256:[0-9a-f]{64}$'
+          url_re='^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~%+-]+)+$'
+          repo_re='^(https|oci)://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~-]+)*$'
+          chart_re='^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$'
+          version_re='^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          path_re='^[A-Za-z0-9_][A-Za-z0-9._/-]*$'
+          check_digest() {
+            local got
+            got="sha256:$(sha256sum "$1" | cut -d' ' -f1)"
+            [[ "$got" == "$2" ]] || fail "$3 has the sha256 $got, not the pinned $2: the file changed upstream or the pin is wrong"
+          }
+          n=0
+          for line in "${manifests[@]}"; do
+            read -r -a f <<< "$line"
+            (( ${#f[@]} == 2 )) || fail "a prerequisite-manifests line needs 2 fields, URL and sha256:DIGEST: $line"
+            url="${f[0]}"
+            digest="${f[1]}"
+            [[ "$url" =~ $url_re ]] || fail "a prerequisite manifest needs a plain https:// URL (no query, port or user): $url"
+            [[ "$digest" =~ $digest_re ]] || fail "the digest of $url must be sha256: and 64 lowercase hex digits"
+            n=$((n + 1))
+            file="$dir/manifest-$n.yaml"
+            curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-filesize 50000000 -o "$file" "$url" \
+              || fail "could not download $url"
+            check_digest "$file" "$digest" "$url"
+            printf 'manifest\t%s\t%s\n' "$file" "$url" >> "$plan"
+            echo "manifest $url ($digest)"
+          done
+          seen=" "
+          for line in "${charts[@]}"; do
+            read -r -a f <<< "$line"
+            (( ${#f[@]} == 7 )) \
+              || fail "a prerequisite-charts line needs 7 fields, RELEASE NAMESPACE REPOSITORY CHART VERSION sha256:DIGEST VALUES-FILE: $line"
+            release="${f[0]}"
+            ns="${f[1]}"
+            repo="${f[2]}"
+            chart="${f[3]}"
+            version="${f[4]}"
+            digest="${f[5]}"
+            values="${f[6]}"
+            [[ "$release" =~ $name_re ]] || fail "a prerequisite release must be a lowercase name (letters, digits, dashes): $release"
+            [[ "$ns" =~ $name_re ]] || fail "the namespace of $release is not a valid Kubernetes name: $ns"
+            [[ "$ns/$release" != "$NAMESPACE/$SERVICE" ]] || fail "the prerequisite $release in $ns is the release of the repository's own chart"
+            [[ "$seen" != *" $ns/$release "* ]] || fail "the prerequisite $release in $ns is listed twice"
+            seen+="$ns/$release "
+            [[ "$repo" =~ $repo_re ]] || fail "the repository of $release must be an https:// or oci:// address: $repo"
+            [[ "$chart" =~ $chart_re ]] || fail "the chart of $release is not a chart name: $chart"
+            [[ "$version" =~ $version_re ]] || fail "the chart version of $release must be one exact version such as 1.2.3, not a range: $version"
+            [[ "$digest" =~ $digest_re ]] || fail "the digest of $release must be sha256: and 64 lowercase hex digits"
+            if [[ "$values" != - ]]; then
+              [[ "$values" =~ $path_re && "/$values/" != */../* ]] \
+                || fail "the values file of $release must be a path inside the repository, or - for none: $values"
+              [[ -f "$values" ]] || fail "the values file $values of $release is not in the repository"
+            fi
+            n=$((n + 1))
+            out="$dir/chart-$n"
+            mkdir "$out"
+            if [[ "$repo" == oci://* ]]; then
+              helm pull "$repo/$chart" --version "$version" -d "$out" || fail "could not pull $chart $version from $repo"
+            else
+              helm pull "$chart" --repo "$repo" --version "$version" -d "$out" || fail "could not pull $chart $version from $repo"
+            fi
+            archive=$(find "$out" -maxdepth 1 -name '*.tgz' -print -quit)
+            [[ -n "$archive" ]] || fail "helm pull of $chart $version left no chart archive"
+            check_digest "$archive" "$digest" "the chart archive of $chart $version"
+            printf 'chart\t%s\t%s\t%s\t%s\t%s\n' "$release" "$ns" "$archive" "$values" "$chart $version" >> "$plan"
+            echo "chart $chart $version ($digest): release $release in $ns, values file $values"
+          done
+
+      - name: Prerequisites (install in order)
+        id: prerequisites
+        # After the stuck-release check of the repository's own release and before the Secret, so a failed prerequisite
+        # stops the deploy before any setting of the service changes. First every prerequisite release is checked, then
+        # the manifests (CRD bundles) are applied, then the charts are installed in the order listed.
+        if: inputs.prerequisite-manifests != '' || inputs.prerequisite-charts != ''
+        run: |
+          plan="$RUNNER_TEMP/prerequisites/plan"
+          # 1. Before anything changes: no prerequisite release may be stuck in pending-* from an interrupted deploy.
+          #    The same logic as the step "Release is not stuck" for the repository's own release: only detect it and
+          #    name the fix. Every stuck release is named, then the step stops.
+          stuck=0
+          while IFS=$'\t' read -r -u 3 kind a b c d e; do
+            [[ "$kind" == chart ]] || continue
+            err_file="$RUNNER_TEMP/prerequisite-history.err"
+            if ! history=$(helm history "$a" -n "$b" -o json 2> "$err_file"); then
+              if grep -q 'not found' "$err_file"; then
+                echo "First install of the prerequisite $a in $b."
+                continue
+              fi
+              cat "$err_file" >&2
+              echo "::error::helm history of the prerequisite $a in $b failed (see above)"
+              exit 1
+            fi
+            status=$(jq -r 'max_by(.revision) | .status' <<< "$history")
+            [[ "$status" == pending-* ]] || continue
+            good=$(jq -r '[.[] | select(.status == "deployed" or .status == "superseded")]
+              | max_by(.revision) | .revision // empty' <<< "$history")
+            if [[ -n "$good" ]]; then
+              echo "::error::the prerequisite release $a in $b is stuck in $status (an earlier deploy was interrupted): run 'helm rollback $a $good -n $b --wait', then deploy again"
+            else
+              echo "::error::the prerequisite release $a in $b is stuck in $status and was never deployed: run 'helm uninstall $a -n $b', then deploy again"
+            fi
+            stuck=$((stuck + 1))
+          done 3< "$plan"
+          if (( stuck > 0 )); then exit 1; fi
+          # Server-side apply of cluster-wide objects (field manager of the Secret step), then a wait until the CRDs
+          # among them are Established, so a chart that uses them can start.
+          apply_and_wait() {
+            local applied object
+            local crds=()
+            applied=$(kubectl apply --server-side --field-manager=ci-cd --force-conflicts -f "$1" -o name)
+            printf '%s\n' "$applied"
+            while IFS= read -r object; do
+              if [[ "$object" == customresourcedefinition.apiextensions.k8s.io/* ]]; then crds+=("$object"); fi
+            done <<< "$applied"
+            if (( ${#crds[@]} > 0 )); then kubectl wait --for=condition=Established --timeout=60s "${crds[@]}"; fi
+          }
+          # 2. The manifests, then the charts, in the order of the plan.
+          while IFS=$'\t' read -r -u 3 kind a b c d e; do
+            case "$kind" in
+              manifest)
+                # a: the verified file, b: its URL.
+                echo "::group::manifest $b"
+                apply_and_wait "$a"
+                echo "::endgroup::"
+                ;;
+              chart)
+                # a: release, b: namespace, c: the verified archive, d: values file or -, e: chart and version.
+                values_args=()
+                if [[ "$d" != - ]]; then values_args=(-f "$d"); fi
+                echo "::group::$e as release $a in $b"
+                # Helm installs the CRDs of a chart's crds/ folder only when they are missing and never upgrades them.
+                # So the pipeline applies them itself on every deploy (a chart upgrade brings its new CRDs too), and
+                # Helm skips the folder.
+                crd_file="$RUNNER_TEMP/prerequisites/crds-$b-$a.yaml"
+                helm show crds "$c" > "$crd_file"
+                crd_args=()
+                if [[ -s "$crd_file" ]]; then
+                  echo "The crds/ folder of $e, applied before the release:"
+                  apply_and_wait "$crd_file"
+                  crd_args=(--skip-crds)
+                fi
+                # --create-namespace: a third-party part may live in a namespace of its own (cert-manager); the
+                # repository's own namespace is still created once by hand (step "Namespace exists").
+                helm upgrade --install "$a" "$c" -n "$b" --create-namespace "${values_args[@]}" "${crd_args[@]}" \
+                  --rollback-on-failure --wait --timeout 5m --history-max 10
+                echo "::endgroup::"
+                ;;
+            esac
+          done 3< "$plan"
+
       - name: Application Secret from the organization secret (idempotent)
         id: app-env
         # Never "helm --set" for secrets: Helm keeps the values in the release history.
@@ -435,11 +1281,17 @@ jobs:
             exit 0
           fi
           # GitHub masks the whole secret, not its single values; "helm test --logs" or an error
-          # message could print one, so every value is masked for the rest of this job.
+          # message could print one, so every value is masked for the rest of this job. The runner reads %25, %0D and
+          # %0A in a command as %, CR and LF: escape them first (as @actions/core does), so a value with % or CR is
+          # masked as it is.
           while IFS= read -r line; do
             [[ "$line" == *=* && "$line" != '#'* ]] || continue
             value="${line#*=}"
-            if [[ -n "$value" ]]; then echo "::add-mask::$value"; fi
+            if [[ -n "$value" ]]; then
+              mask="${value//%/%25}"
+              mask="${mask//$'\r'/%0D}"
+              echo "::add-mask::${mask//$'\n'/%0A}"
+            fi
           done <<< "$APP_ENV"
           umask 077
           env_file="$RUNNER_TEMP/$SERVICE.env"
@@ -462,13 +1314,21 @@ jobs:
           APP_ENV_CHECKSUM: ${{ steps.app-env.outputs.checksum }}
         run: |
           extra=()
+          # The host-dependent values of the step "Host-dependent values (prod)" first, then those of "Deploy-time values
+          # (prod)" (both empty when the repository lists none; secret-values as --set-file with a file in RUNNER_TEMP),
+          # so the pipeline's own values below always win (secret-values may not set image.* or podAnnotations.*).
+          if [[ -s "$RUNNER_TEMP/host-args" ]]; then
+            mapfile -d '' -t host_args < "$RUNNER_TEMP/host-args"
+            extra=("${host_args[@]}")
+          fi
+          # Image values only for a service with an image (build-image: true); a chart without one gets none.
+          if [[ "$WITH_IMAGE" == true ]]; then
+            extra+=(--set-string "image.repository=$IMAGE" --set-string "image.tag=sha-$SHA" --set-string "image.digest=$DIGEST")
+          fi
           if [[ -n "$APP_ENV_CHECKSUM" ]]; then
-            extra=(--set-string "podAnnotations.checksum/app-env=$APP_ENV_CHECKSUM")
+            extra+=(--set-string "podAnnotations.checksum/app-env=$APP_ENV_CHECKSUM")
           fi
           helm upgrade --install "$SERVICE" "$CHART" -n "$NAMESPACE" -f "$VALUES_FILE" \
-            --set-string "image.repository=$IMAGE" \
-            --set-string "image.tag=sha-$SHA" \
-            --set-string "image.digest=$DIGEST" \
             "${extra[@]}" \
             --rollback-on-failure --wait --timeout 5m --history-max 10
 
@@ -496,9 +1356,17 @@ jobs:
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
           SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
           ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+          PREREQUISITES_OUTCOME: ${{ steps.prerequisites.outcome }}
           EVENT: ${{ github.event_name }}
         run: |
           if [[ "$ROLLBACK_OUTCOME" == "skipped" ]]; then ROLLBACK_OUTCOME="not needed"; fi
+          # A row for the prerequisites only when the repository lists some (the step is skipped otherwise).
+          prerequisites_row=""
+          if [[ -n "$PREREQUISITES_OUTCOME" && "$PREREQUISITES_OUTCOME" != "skipped" ]]; then
+            prerequisites_row="| Prerequisites (manifests and charts) | $PREREQUISITES_OUTCOME |"
+          fi
+          image_row="\`$IMAGE@${DIGEST:-unknown}\`"
+          if [[ "$WITH_IMAGE" != true ]]; then image_row="none (a chart without an image)"; fi
           revision="unknown"
           if [[ -n "$DEPLOY_OUTCOME" && "$DEPLOY_OUTCOME" != "skipped" ]] && command -v helm > /dev/null; then
             revision=$(helm history "$SERVICE" -n "$NAMESPACE" --max 1 -o json 2> /dev/null \
@@ -510,7 +1378,8 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| Commit | \`$SHA\` |"
-            echo "| Image | \`$IMAGE@${DIGEST:-unknown}\` |"
+            echo "| Image | $image_row |"
+            if [[ -n "$prerequisites_row" ]]; then echo "$prerequisites_row"; fi
             echo "| Helm upgrade | ${DEPLOY_OUTCOME:-not run} |"
             echo "| Smoke test | ${SMOKE_OUTCOME:-not run} |"
             echo "| Rollback after a failed smoke test | ${ROLLBACK_OUTCOME:-not needed} |"

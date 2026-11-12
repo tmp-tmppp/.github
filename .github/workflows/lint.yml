@@ -36,3 +36,30 @@ jobs:
 
       - name: Starter workflow metadata is valid JSON
         run: jq empty workflow-templates/*.properties.json
+
+      - name: The two copies of the step "Host-dependent values (prod)" are equal
+        # service-ci-cd.yml runs the same script in the test and the deploy job; a change to one copy only would let
+        # the pull request check pass while the deploy behaves differently. The whole step is compared (script, if:,
+        # name, env), except the one env key that differs on purpose (REQUIRE_HOST) and the YAML comments around it.
+        run: |
+          wf=.github/workflows/service-ci-cd.yml
+          step='.steps[] | select(.name == "Host-dependent values (prod)") | del(.env.REQUIRE_HOST) | ... comments = ""'
+          yq ".jobs.test $step" "$wf" > "$RUNNER_TEMP/host-test.yaml"
+          yq ".jobs.deploy $step" "$wf" > "$RUNNER_TEMP/host-deploy.yaml"
+          [[ -s "$RUNNER_TEMP/host-test.yaml" ]] || { echo "::error::the step is missing in the test job"; exit 1; }
+          diff -u "$RUNNER_TEMP/host-test.yaml" "$RUNNER_TEMP/host-deploy.yaml" \
+            || { echo "::error::the two copies of the step differ: change both"; exit 1; }
+
+      - name: The two copies of the steps "Deploy-time values (prod)" and "Prerequisites (fetch and verify)" are equal
+        # The same rule for the two other steps that service-ci-cd.yml runs in both jobs; the only env key that differs on
+        # purpose is REQUIRE_VALUES, so a change to SET_VALUES or SECRET_VALUES in one copy fails.
+        run: |
+          wf=.github/workflows/service-ci-cd.yml
+          for name in "Deploy-time values (prod)" "Prerequisites (fetch and verify)"; do
+            step=".steps[] | select(.name == \"$name\") | del(.env.REQUIRE_VALUES) | ... comments = \"\""
+            yq ".jobs.test $step" "$wf" > "$RUNNER_TEMP/step-test.yaml"
+            yq ".jobs.deploy $step" "$wf" > "$RUNNER_TEMP/step-deploy.yaml"
+            [[ -s "$RUNNER_TEMP/step-test.yaml" ]] || { echo "::error::the step \"$name\" is missing in the test job"; exit 1; }
+            diff -u "$RUNNER_TEMP/step-test.yaml" "$RUNNER_TEMP/step-deploy.yaml" \
+              || { echo "::error::the two copies of the step \"$name\" differ: change both"; exit 1; }
+          done
